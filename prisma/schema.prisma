@@ -1,0 +1,73 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum Mode {
+  polite
+  aggressive
+  uncensored
+}
+
+enum Strategy {
+  smc
+  swing
+  range
+  breakout
+  pullback
+  divergence
+}
+
+enum TradeDirection {
+  long
+  short
+}
+
+enum AlertDirection {
+  above
+  below
+}
+
+model User {
+  id                Int       @id @default(autoincrement())
+  telegramId        String    @unique
+  deposit           Decimal   @default(0)
+  mode              Mode      @default(polite)
+  preferredStrategy Strategy  @default(smc)
+  trades            Trade[]
+  alerts            Alert[]
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+}
+
+model Trade {
+  id           Int            @id @default(autoincrement())
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId       Int
+  symbol       String
+  direction    TradeDirection
+  entries      Json           // numeric array, e.g. [entry1, entry2, entry3]
+  tps          Json           // numeric array, e.g. [tp1, tp2, tp3]
+  slBe         Decimal
+  size         Decimal
+  riskPercent  Float
+  validated    Boolean        @default(false)
+  strategy     String
+  createdAt    DateTime       @default(now())
+}
+
+model Alert {
+  id          Int            @id @default(autoincrement())
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId      Int
+  symbol      String
+  targetPrice Decimal
+  direction   AlertDirection
+  active      Boolean        @default(true)
+  createdAt   DateTime       @default(now())
+}
+
