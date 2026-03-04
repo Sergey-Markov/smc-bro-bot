@@ -38,6 +38,7 @@ model User {
   deposit           Decimal   @default(0)
   mode              Mode      @default(polite)
   preferredStrategy Strategy  @default(smc)
+  premium           Boolean   @default(false)
   trades            Trade[]
   alerts            Alert[]
   createdAt         DateTime  @default(now())

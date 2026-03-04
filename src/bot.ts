@@ -9,18 +9,16 @@ import {
 import OpenAI from "openai";
 import { prisma } from "./prisma";
 import { redis } from "./redis";
-import {
-  Alert,
-  AlertDirection,
-  Mode,
-  Strategy,
-  Trade,
-  TradeDirection,
-  User,
-} from "@prisma/client";
+import { runBacktest, BacktestStrategy } from "./backtest";
+import { Alert, AlertDirection, Mode, Strategy, Trade, TradeDirection, User } from "@prisma/client";
 import ccxt from "ccxt";
 import cron from "node-cron";
-import { ATR, MACD, RSI } from "technicalindicators";
+import {
+  OhlcvValidationInput,
+  ValidationResult,
+  validateAlertByStrategy,
+} from "./strategyValidation";
+import { binance } from "./exchange";
 
 const { TELEGRAM_TOKEN, GROK_API_KEY } = process.env;
 
@@ -55,10 +53,6 @@ type MyContext = Context & SessionFlavor<SessionData> & ConversationFlavor;
 type MyConversation = Conversation<MyContext>;
 
 const bot = new Bot<MyContext>(TELEGRAM_TOKEN);
-
-const binance = new ccxt.binance({
-  enableRateLimit: true,
-});
 
 async function getCachedValue(key: string): Promise<string | null> {
   if (!redis) {
@@ -124,6 +118,7 @@ async function getOrCreateUser(ctx: MyContext) {
       telegramId,
       mode: Mode.polite,
       preferredStrategy: Strategy.smc,
+      premium: false,
     },
   });
 
@@ -836,12 +831,7 @@ function serializeTradesForAi(trades: Trade[]): string {
 
 async function fetchOhlcvForValidation(
   symbol: string,
-): Promise<{
-  closes: number[];
-  highs: number[];
-  lows: number[];
-  volumes: number[];
-} | null> {
+): Promise<OhlcvValidationInput | null> {
   try {
     const candles = await binance.fetchOHLCV(symbol, "4h", undefined, 100);
 
@@ -867,228 +857,6 @@ async function fetchOhlcvForValidation(
     // eslint-disable-next-line no-console
     console.error("Failed to fetch OHLCV for", symbol, error);
     return null;
-  }
-}
-
-interface ValidationResult {
-  isValid: boolean;
-  reason: string;
-}
-
-function validateSmcStructure(
-  closes: number[],
-  highs: number[],
-  lows: number[],
-  direction: AlertDirection,
-): ValidationResult {
-  if (closes.length < 10 || highs.length < 10 || lows.length < 10) {
-    return {
-      isValid: false,
-      reason: "Замало свічок для структури SMC.",
-    };
-  }
-
-  const lookback = Math.min(50, highs.length);
-  const recentHighs = highs.slice(-lookback);
-  const recentLows = lows.slice(-lookback);
-  const lastClose = closes[closes.length - 1];
-
-  const swingHigh = Math.max(...recentHighs);
-  const swingLow = Math.min(...recentLows);
-  const breakoutThreshold = 0.001; // ~0.1% для BOS
-
-  if (direction === AlertDirection.above) {
-    const brokeHigh = lastClose > swingHigh * (1 + breakoutThreshold);
-
-    return brokeHigh
-      ? {
-          isValid: true,
-          reason: "Є BOS вище останнього свінг-хая (SMC).",
-        }
-      : {
-          isValid: false,
-          reason: "Немає чіткого BOS вище свінг-хая.",
-        };
-  }
-
-  const brokeLow = lastClose < swingLow * (1 - breakoutThreshold);
-
-  return brokeLow
-    ? {
-        isValid: true,
-        reason: "Є BOS нижче останнього свінг-лоу (SMC).",
-      }
-    : {
-        isValid: false,
-        reason: "Немає чіткого BOS нижче свінг-лоу.",
-      };
-}
-
-function validateRangeEnvironment(
-  lastClose: number,
-  lastAtr: number | undefined,
-): ValidationResult {
-  if (!lastAtr || !Number.isFinite(lastAtr) || !Number.isFinite(lastClose)) {
-    return {
-      isValid: false,
-      reason: "ATR/ціна некоректні для оцінки ренджу.",
-    };
-  }
-
-  const atrRatio = lastAtr / lastClose;
-  const isRange = atrRatio < 0.01; // <1% діапазон за 4h
-
-  return isRange
-    ? {
-        isValid: true,
-        reason: "ATR низький — ринок більше схожий на рендж.",
-      }
-    : {
-        isValid: false,
-        reason: "ATR високий — зараз не класичний рендж.",
-      };
-}
-
-function validateBreakoutEnvironment(
-  closes: number[],
-  volumes: number[],
-): ValidationResult {
-  if (closes.length < 5 || volumes.length < 21) {
-    return {
-      isValid: false,
-      reason: "Мало даних для оцінки об'ємів на брейкаут.",
-    };
-  }
-
-  const lastVolume = volumes[volumes.length - 1];
-  const window = Math.min(20, volumes.length - 1);
-  const baseSlice = volumes.slice(-window - 1, -1);
-  const baseVolumeAvg =
-    baseSlice.reduce((acc, v) => acc + v, 0) / baseSlice.length;
-
-  const isSpike = lastVolume > baseVolumeAvg * 1.5;
-
-  return isSpike
-    ? {
-        isValid: true,
-        reason: "Є об'ємний спайк — брейкаут виглядає реальним.",
-      }
-    : {
-        isValid: false,
-        reason: "Об'єм слабкий — брейкаут може бути фейковим.",
-      };
-}
-
-function validateDivergenceEnvironment(
-  closes: number[],
-  rsiSeries: number[],
-): ValidationResult {
-  if (closes.length < 10 || rsiSeries.length < 10) {
-    return {
-      isValid: false,
-      reason: "Замало даних для дивергенції.",
-    };
-  }
-
-  const priceStart = closes[closes.length - 5];
-  const priceEnd = closes[closes.length - 1];
-  const rsiStart = rsiSeries[rsiSeries.length - 5];
-  const rsiEnd = rsiSeries[rsiSeries.length - 1];
-
-  const makingHigherHigh = priceEnd > priceStart;
-  const makingLowerLow = priceEnd < priceStart;
-  const momentumUp = rsiEnd > rsiStart;
-  const momentumDown = rsiEnd < rsiStart;
-
-  const bullishDivergence = makingLowerLow && momentumUp;
-  const bearishDivergence = makingHigherHigh && momentumDown;
-
-  const hasDivergence = bullishDivergence || bearishDivergence;
-
-  return hasDivergence
-    ? {
-        isValid: true,
-        reason: "Є базова RSI-дивергенція між ціною та моментумом.",
-      }
-    : {
-        isValid: false,
-        reason: "Чіткої дивергенції за RSI поки не видно.",
-      };
-}
-
-async function validateAlertByStrategy(params: {
-  symbol: string;
-  direction: AlertDirection;
-  strategy: Strategy;
-}): Promise<ValidationResult> {
-  const ohlcv = await fetchOhlcvForValidation(params.symbol);
-
-  if (!ohlcv) {
-    return {
-      isValid: false,
-      reason: "Не вдалося отримати OHLCV для валідації.",
-    };
-  }
-
-  const { closes, highs, lows, volumes } = ohlcv;
-
-  if (!closes.length) {
-    return {
-      isValid: false,
-      reason: "OHLCV порожній для цього символу.",
-    };
-  }
-
-  const atrSeries = ATR.calculate({
-    high: highs,
-    low: lows,
-    close: closes,
-    period: 14,
-  });
-  const lastAtr = atrSeries[atrSeries.length - 1];
-
-  const rsiSeries = RSI.calculate({
-    values: closes,
-    period: 14,
-  });
-
-  const macdSeries = MACD.calculate({
-    values: closes,
-    fastPeriod: 12,
-    slowPeriod: 26,
-    signalPeriod: 9,
-    SimpleMAOscillator: false,
-    SimpleMASignal: false,
-  });
-
-  // поки що MACD лише для контексту, можна використати глибше пізніше
-  if (!macdSeries.length) {
-    // немає MACD, але це не критично, просто менше сигналів
-  }
-
-  const lastClose = closes[closes.length - 1];
-
-  switch (params.strategy) {
-    case Strategy.smc:
-      return validateSmcStructure(closes, highs, lows, params.direction);
-
-    case Strategy.range:
-      return validateRangeEnvironment(lastClose, lastAtr);
-
-    case Strategy.breakout:
-      return validateBreakoutEnvironment(closes, volumes);
-
-    case Strategy.divergence:
-      return validateDivergenceEnvironment(closes, rsiSeries);
-
-    case Strategy.swing:
-    case Strategy.pullback:
-    default:
-      return {
-        isValid: true,
-        reason:
-          "Спеціфічного валідатора для цієї стратегії ще немає — тримаємо базову згоду.",
-      };
   }
 }
 
@@ -1194,8 +962,14 @@ async function handleSingleAlert(alert: AlertWithUser): Promise<void> {
     return;
   }
 
-  const validation = await validateAlertByStrategy({
-    symbol,
+  const ohlcv = await fetchOhlcvForValidation(symbol);
+
+  if (!ohlcv) {
+    return;
+  }
+
+  const validation: ValidationResult = validateAlertByStrategy({
+    ohlcv,
     direction,
     strategy: user.preferredStrategy,
   });
@@ -1289,6 +1063,24 @@ bot.command("setstrategy", async (ctx) => {
 
 bot.command("add", async (ctx) => {
   await ctx.conversation.enter("addTradeConversation");
+});
+
+bot.command("subscribe", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+
+  await ctx.reply(
+    [
+      "Преміум режим поки що вмикається вручну.",
+      "",
+      "Планована логіка:",
+      "- /subscribe відкриває Stripe checkout на ~$5/місяць;",
+      "- після успішної оплати webhook оновлює поле premium=true у твоєму профілі;",
+      "- преміум дає доступ до /analyze, /backtest та інших AI- і backtest-фіч.",
+      "",
+      `Зараз твій статус premium: ${user.premium ? "ON" : "OFF"}.`,
+      "Для дев-режиму можеш тимчасово виставити premium=true в БД вручну.",
+    ].join("\n"),
+  );
 });
 
 bot.command("alert", async (ctx) => {
@@ -1464,8 +1256,132 @@ bot.command("report", async (ctx) => {
   await ctx.reply(lines.join("\n"));
 });
 
+bot.command("backtest", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+
+  if (!user.premium) {
+    await ctx.reply(
+      [
+        "Ця команда доступна тільки для преміум користувачів.",
+        "Введи /subscribe, щоб отримати доступ до бек-тестингу стратегій.",
+      ].join("\n"),
+    );
+    return;
+  }
+  const text = ctx.message?.text ?? "";
+  const parts = text.trim().split(/\s+/).slice(1);
+
+  if (parts.length < 3) {
+    await ctx.reply(
+      [
+        "Використання:",
+        "/backtest SYMBOL TIMEFRAME(4h|1d) STRATEGY [CANDLES]",
+        "",
+        "Приклади:",
+        "- /backtest BTCUSDT 4h breakout",
+        "- /backtest ETHUSDT 1d range 400",
+      ].join("\n"),
+    );
+    return;
+  }
+
+  const [symbolRaw, timeframeRaw, strategyRaw, candlesRaw] = parts;
+  const symbol = symbolRaw.toUpperCase();
+  const timeframeText = timeframeRaw.toLowerCase();
+
+  const timeframe =
+    timeframeText === "1d" || timeframeText === "1day" ? "1d" : "4h";
+
+  const normalizedStrategy = strategyRaw.toLowerCase() as BacktestStrategy;
+  const allowedStrategies: BacktestStrategy[] = [
+    "smc",
+    "swing",
+    "range",
+    "breakout",
+    "pullback",
+    "divergence",
+  ];
+
+  if (!allowedStrategies.includes(normalizedStrategy)) {
+    await ctx.reply(
+      "Стратегія має бути однією з: smc, swing, range, breakout, pullback, divergence.",
+    );
+    return;
+  }
+
+  const defaultLimit = 500;
+  const limit = candlesRaw
+    ? Number(candlesRaw)
+    : defaultLimit;
+
+  if (!Number.isFinite(limit) || limit <= 50) {
+    await ctx.reply(
+      "Кількість свічок має бути числом > 50. Спробуй ще раз.",
+    );
+    return;
+  }
+
+  let candles: ccxt.OHLCV[];
+
+  try {
+    candles = await binance.fetchOHLCV(symbol, timeframe, undefined, limit);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("Backtest OHLCV error", symbol, error);
+    await ctx.reply("Не вийшло отримати історію для бек-тесту. Спробуй пізніше.");
+    return;
+  }
+
+  if (!candles.length) {
+    await ctx.reply("Історія по цьому символу порожня.");
+    return;
+  }
+
+  const result = runBacktest(candles, normalizedStrategy);
+
+  if (!result.totalTrades) {
+    await ctx.reply(
+      "За обраними параметрами не вийшло згенерувати жодної умовної угоди.",
+    );
+    return;
+  }
+
+  const modeTone = modeToToneInstruction(user.mode);
+
+  const header = `Backtest ${symbol} @ ${timeframe} для стратегії ${normalizedStrategy}`;
+
+  const lines: string[] = [];
+
+  lines.push(header);
+  lines.push(
+    `Угод: ${result.totalTrades}, win-rate: ${result.winRate.toFixed(
+      2,
+    )}%, умовний P/L: ${result.pnlR.toFixed(2)}R`,
+  );
+  lines.push(
+    `Long: ${result.longTrades}, Short: ${result.shortTrades}, перемоги: ${result.wins}, поразки: ${result.losses}`,
+  );
+  lines.push("");
+  lines.push(
+    "Це умовний симулятор на базі OHLCV і простих правил, а не реальний історичний PnL.",
+  );
+  lines.push(`Mode: ${user.mode} -> ${modeTone}.`);
+
+  await ctx.reply(lines.join("\n"));
+});
+
 bot.command("analyze", async (ctx) => {
   const user = await getOrCreateUser(ctx);
+
+  if (!user.premium) {
+    await ctx.reply(
+      [
+        "Ця команда доступна тільки для преміум користувачів.",
+        "Введи /subscribe, щоб отримати доступ до AI-аналізу угод.",
+      ].join("\n"),
+    );
+    return;
+  }
 
   if (!grokClient) {
     await ctx.reply(

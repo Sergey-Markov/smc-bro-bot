@@ -5,8 +5,10 @@
   "main": "dist/bot.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/bot.ts",
+    "dev:server": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
     "start": "node dist/bot.js",
+    "test": "jest",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev --name init",
     "prisma:studio": "prisma studio"
@@ -21,7 +23,7 @@
     "node-cron": "^3.0.3",
     "openai": "^4.80.0",
     "prisma": "^6.0.0",
-    "technicalindicators": "^4.1.0"
+    "technicalindicators": "^3.1.0"
   },
   "devDependencies": {
     "ts-node": "^10.9.2",
