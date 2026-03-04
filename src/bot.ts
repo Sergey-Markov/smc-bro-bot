@@ -12,6 +12,8 @@ import {
   AlertDirection,
   Mode,
   Strategy,
+  Trade,
+  TradeDirection,
   User,
 } from "@prisma/client";
 import ccxt from "ccxt";
@@ -548,6 +550,95 @@ async function addTradeConversation(
 
 type AlertWithUser = Alert & { user: User };
 
+type TradeWithUser = Trade & { user: User };
+
+function buildStrategyTip(strategy: string): string {
+  switch (strategy) {
+    case "pullback":
+      return "Подивись на EMA20 — класичний pullback може вже відпрацьовувати.";
+    case "smc":
+      return "Перевір sweep і BOS/CHOCH перед будь-яким перезаходом.";
+    case "swing":
+      return "Тримай фокус на старшому таймфреймі та ключових свінгах.";
+    case "range":
+      return "Фіксуй частину в межах ренджу, не ганяйся за кожним пробоєм.";
+    case "breakout":
+      return "Дочекайся ретесту рівня, не стрибай за свічкою без підтвердження.";
+    case "divergence":
+      return "Перевір, чи дивергенція ще актуальна, не перезаходь всліпу.";
+    default:
+      return "Тримайся свого плану по цій стратегії та не роздувай ризик.";
+  }
+}
+
+function buildModeAwareTp1Message(args: {
+  mode: Mode;
+  symbol: string;
+  strategy: string;
+  pnl: number;
+}): string {
+  const baseLine = `TP1 взято по ${args.symbol}.`;
+  const pnlLine = `Умовний профіт за TP1 ≈ +${args.pnl.toFixed(2)} USDT.`;
+  const tip = buildStrategyTip(args.strategy);
+
+  if (args.mode === Mode.polite) {
+    return [
+      baseLine,
+      pnlLine,
+      "",
+      `Рекомендація: перенесіть SL у BE згідно зі стратегією ${args.strategy}.`,
+      tip,
+    ].join("\n");
+  }
+
+  if (args.mode === Mode.aggressive) {
+    return [
+      baseLine,
+      pnlLine,
+      "",
+      `Перекоти SL в BE і захисти профіт по ${args.strategy}.`,
+      tip,
+    ].join("\n");
+  }
+
+  return [
+    `${baseLine} Fuck yeah, TP1 hit!`,
+    pnlLine,
+    "",
+    `Перекинь SL в BE по ${args.strategy} і не дай ринку відкусити профіт.`,
+    tip,
+  ].join("\n");
+}
+
+function calculateTp1Pnl(trade: Trade): number | null {
+  const entries = (trade.entries as unknown as number[]) || [];
+  const tps = (trade.tps as unknown as number[]) || [];
+
+  if (!entries.length || !tps.length) {
+    return null;
+  }
+
+  const entry = Number(entries[0]);
+  const tp1 = Number(tps[0]);
+  const size = Number(trade.size);
+
+  if (
+    !Number.isFinite(entry) ||
+    !Number.isFinite(tp1) ||
+    !Number.isFinite(size) ||
+    entry <= 0
+  ) {
+    return null;
+  }
+
+  const isLong = trade.direction === TradeDirection.long;
+  const priceDiff = isLong ? tp1 - entry : entry - tp1;
+
+  return (priceDiff / entry) * size;
+}
+
+type TradeWithUser = Trade & { user: User };
+
 async function fetchCurrentPrice(symbol: string): Promise<number | null> {
   try {
     const ticker = await binance.fetchTicker(symbol);
@@ -562,6 +653,81 @@ async function fetchCurrentPrice(symbol: string): Promise<number | null> {
     // eslint-disable-next-line no-console
     console.error("Failed to fetch ticker for", symbol, error);
     return null;
+  }
+}
+
+async function handleOpenTrade(trade: TradeWithUser): Promise<void> {
+  const entries = (trade.entries as unknown as number[]) || [];
+  const tps = (trade.tps as unknown as number[]) || [];
+
+  if (!entries.length || !tps.length) {
+    return;
+  }
+
+  const entry = Number(entries[0]);
+  const tp1 = Number(tps[0]);
+
+  if (!Number.isFinite(entry) || !Number.isFinite(tp1) || entry <= 0) {
+    return;
+  }
+
+  const currentPrice = await fetchCurrentPrice(trade.symbol);
+
+  if (!currentPrice) {
+    return;
+  }
+
+  const isLong = trade.direction === TradeDirection.long;
+  const tp1Hit = isLong ? currentPrice >= tp1 : currentPrice <= tp1;
+
+  if (!tp1Hit) {
+    return;
+  }
+
+  const pnl = calculateTp1Pnl(trade);
+
+  if (pnl == null) {
+    return;
+  }
+
+  const chatId = Number.isFinite(Number(trade.user.telegramId))
+    ? Number(trade.user.telegramId)
+    : trade.user.telegramId;
+
+  const message = buildModeAwareTp1Message({
+    mode: trade.user.mode,
+    symbol: trade.symbol,
+    strategy: trade.strategy,
+    pnl,
+  });
+
+  try {
+    await bot.api.sendMessage(chatId, message);
+  } finally {
+    await prisma.trade.update({
+      where: { id: trade.id },
+      data: { profitLoss: pnl.toString() },
+    });
+  }
+}
+
+async function processOpenTradesTick(): Promise<void> {
+  const openTrades = await prisma.trade.findMany({
+    where: { profitLoss: 0 },
+    include: { user: true },
+  });
+
+  if (!openTrades.length) {
+    return;
+  }
+
+  for (const trade of openTrades) {
+    try {
+      await handleOpenTrade(trade);
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("Failed to handle open trade", trade.id, error);
+    }
   }
 }
 
@@ -977,6 +1143,10 @@ async function processAlertsTick(): Promise<void> {
 
 cron.schedule("*/5 * * * *", async () => {
   await processAlertsTick();
+});
+
+cron.schedule("*/15 * * * *", async () => {
+  await processOpenTradesTick();
 });
 
 bot.use(createConversation(setModeConversation, "setModeConversation"));

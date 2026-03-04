@@ -55,6 +55,7 @@ model Trade {
   slBe         Decimal
   size         Decimal
   riskPercent  Float
+  profitLoss   Decimal        @default(0)
   validated    Boolean        @default(false)
   strategy     String
   createdAt    DateTime       @default(now())
