@@ -7,7 +7,16 @@ import {
   ConversationFlavor,
 } from "@grammyjs/conversations";
 import { prisma } from "./prisma";
-import { Mode, Strategy } from "@prisma/client";
+import {
+  Alert,
+  AlertDirection,
+  Mode,
+  Strategy,
+  User,
+} from "@prisma/client";
+import ccxt from "ccxt";
+import cron from "node-cron";
+import { ATR, MACD, RSI } from "technicalindicators";
 
 const { TELEGRAM_TOKEN, GROK_API_KEY } = process.env;
 
@@ -38,6 +47,10 @@ type MyContext = Context & SessionFlavor<SessionData> & ConversationFlavor;
 type MyConversation = Conversation<MyContext>;
 
 const bot = new Bot<MyContext>(TELEGRAM_TOKEN);
+
+const binance = new ccxt.binance({
+  enableRateLimit: true,
+});
 
 bot.use(
   session({
@@ -533,6 +546,439 @@ async function addTradeConversation(
   }
 }
 
+type AlertWithUser = Alert & { user: User };
+
+async function fetchCurrentPrice(symbol: string): Promise<number | null> {
+  try {
+    const ticker = await binance.fetchTicker(symbol);
+    const candidate = (ticker.last ?? ticker.close) as number | undefined;
+
+    if (!candidate || !Number.isFinite(candidate)) {
+      return null;
+    }
+
+    return candidate;
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("Failed to fetch ticker for", symbol, error);
+    return null;
+  }
+}
+
+async function fetchOhlcvForValidation(
+  symbol: string,
+): Promise<{
+  closes: number[];
+  highs: number[];
+  lows: number[];
+  volumes: number[];
+} | null> {
+  try {
+    const candles = await binance.fetchOHLCV(symbol, "4h", undefined, 100);
+
+    if (!candles.length) {
+      return null;
+    }
+
+    const closes: number[] = [];
+    const highs: number[] = [];
+    const lows: number[] = [];
+    const volumes: number[] = [];
+
+    for (const [, open, high, low, close, volume] of candles) {
+      // open is ignored here, але можна додати пізніше
+      closes.push(Number(close));
+      highs.push(Number(high));
+      lows.push(Number(low));
+      volumes.push(Number(volume));
+    }
+
+    return { closes, highs, lows, volumes };
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("Failed to fetch OHLCV for", symbol, error);
+    return null;
+  }
+}
+
+interface ValidationResult {
+  isValid: boolean;
+  reason: string;
+}
+
+function validateSmcStructure(
+  closes: number[],
+  highs: number[],
+  lows: number[],
+  direction: AlertDirection,
+): ValidationResult {
+  if (closes.length < 10 || highs.length < 10 || lows.length < 10) {
+    return {
+      isValid: false,
+      reason: "Замало свічок для структури SMC.",
+    };
+  }
+
+  const lookback = Math.min(50, highs.length);
+  const recentHighs = highs.slice(-lookback);
+  const recentLows = lows.slice(-lookback);
+  const lastClose = closes[closes.length - 1];
+
+  const swingHigh = Math.max(...recentHighs);
+  const swingLow = Math.min(...recentLows);
+  const breakoutThreshold = 0.001; // ~0.1% для BOS
+
+  if (direction === AlertDirection.above) {
+    const brokeHigh = lastClose > swingHigh * (1 + breakoutThreshold);
+
+    return brokeHigh
+      ? {
+          isValid: true,
+          reason: "Є BOS вище останнього свінг-хая (SMC).",
+        }
+      : {
+          isValid: false,
+          reason: "Немає чіткого BOS вище свінг-хая.",
+        };
+  }
+
+  const brokeLow = lastClose < swingLow * (1 - breakoutThreshold);
+
+  return brokeLow
+    ? {
+        isValid: true,
+        reason: "Є BOS нижче останнього свінг-лоу (SMC).",
+      }
+    : {
+        isValid: false,
+        reason: "Немає чіткого BOS нижче свінг-лоу.",
+      };
+}
+
+function validateRangeEnvironment(
+  lastClose: number,
+  lastAtr: number | undefined,
+): ValidationResult {
+  if (!lastAtr || !Number.isFinite(lastAtr) || !Number.isFinite(lastClose)) {
+    return {
+      isValid: false,
+      reason: "ATR/ціна некоректні для оцінки ренджу.",
+    };
+  }
+
+  const atrRatio = lastAtr / lastClose;
+  const isRange = atrRatio < 0.01; // <1% діапазон за 4h
+
+  return isRange
+    ? {
+        isValid: true,
+        reason: "ATR низький — ринок більше схожий на рендж.",
+      }
+    : {
+        isValid: false,
+        reason: "ATR високий — зараз не класичний рендж.",
+      };
+}
+
+function validateBreakoutEnvironment(
+  closes: number[],
+  volumes: number[],
+): ValidationResult {
+  if (closes.length < 5 || volumes.length < 21) {
+    return {
+      isValid: false,
+      reason: "Мало даних для оцінки об'ємів на брейкаут.",
+    };
+  }
+
+  const lastVolume = volumes[volumes.length - 1];
+  const window = Math.min(20, volumes.length - 1);
+  const baseSlice = volumes.slice(-window - 1, -1);
+  const baseVolumeAvg =
+    baseSlice.reduce((acc, v) => acc + v, 0) / baseSlice.length;
+
+  const isSpike = lastVolume > baseVolumeAvg * 1.5;
+
+  return isSpike
+    ? {
+        isValid: true,
+        reason: "Є об'ємний спайк — брейкаут виглядає реальним.",
+      }
+    : {
+        isValid: false,
+        reason: "Об'єм слабкий — брейкаут може бути фейковим.",
+      };
+}
+
+function validateDivergenceEnvironment(
+  closes: number[],
+  rsiSeries: number[],
+): ValidationResult {
+  if (closes.length < 10 || rsiSeries.length < 10) {
+    return {
+      isValid: false,
+      reason: "Замало даних для дивергенції.",
+    };
+  }
+
+  const priceStart = closes[closes.length - 5];
+  const priceEnd = closes[closes.length - 1];
+  const rsiStart = rsiSeries[rsiSeries.length - 5];
+  const rsiEnd = rsiSeries[rsiSeries.length - 1];
+
+  const makingHigherHigh = priceEnd > priceStart;
+  const makingLowerLow = priceEnd < priceStart;
+  const momentumUp = rsiEnd > rsiStart;
+  const momentumDown = rsiEnd < rsiStart;
+
+  const bullishDivergence = makingLowerLow && momentumUp;
+  const bearishDivergence = makingHigherHigh && momentumDown;
+
+  const hasDivergence = bullishDivergence || bearishDivergence;
+
+  return hasDivergence
+    ? {
+        isValid: true,
+        reason: "Є базова RSI-дивергенція між ціною та моментумом.",
+      }
+    : {
+        isValid: false,
+        reason: "Чіткої дивергенції за RSI поки не видно.",
+      };
+}
+
+async function validateAlertByStrategy(params: {
+  symbol: string;
+  direction: AlertDirection;
+  strategy: Strategy;
+}): Promise<ValidationResult> {
+  const ohlcv = await fetchOhlcvForValidation(params.symbol);
+
+  if (!ohlcv) {
+    return {
+      isValid: false,
+      reason: "Не вдалося отримати OHLCV для валідації.",
+    };
+  }
+
+  const { closes, highs, lows, volumes } = ohlcv;
+
+  if (!closes.length) {
+    return {
+      isValid: false,
+      reason: "OHLCV порожній для цього символу.",
+    };
+  }
+
+  const atrSeries = ATR.calculate({
+    high: highs,
+    low: lows,
+    close: closes,
+    period: 14,
+  });
+  const lastAtr = atrSeries[atrSeries.length - 1];
+
+  const rsiSeries = RSI.calculate({
+    values: closes,
+    period: 14,
+  });
+
+  const macdSeries = MACD.calculate({
+    values: closes,
+    fastPeriod: 12,
+    slowPeriod: 26,
+    signalPeriod: 9,
+    SimpleMAOscillator: false,
+    SimpleMASignal: false,
+  });
+
+  // поки що MACD лише для контексту, можна використати глибше пізніше
+  if (!macdSeries.length) {
+    // немає MACD, але це не критично, просто менше сигналів
+  }
+
+  const lastClose = closes[closes.length - 1];
+
+  switch (params.strategy) {
+    case Strategy.smc:
+      return validateSmcStructure(closes, highs, lows, params.direction);
+
+    case Strategy.range:
+      return validateRangeEnvironment(lastClose, lastAtr);
+
+    case Strategy.breakout:
+      return validateBreakoutEnvironment(closes, volumes);
+
+    case Strategy.divergence:
+      return validateDivergenceEnvironment(closes, rsiSeries);
+
+    case Strategy.swing:
+    case Strategy.pullback:
+    default:
+      return {
+        isValid: true,
+        reason:
+          "Спеціфічного валідатора для цієї стратегії ще немає — тримаємо базову згоду.",
+      };
+  }
+}
+
+function buildModeAwareAlertMessage(args: {
+  mode: Mode;
+  symbol: string;
+  strategy: Strategy;
+  targetPrice: number;
+  currentPrice: number;
+  valid: boolean;
+  reason: string;
+}): string {
+  const strategyLabel = args.strategy;
+  const header = [
+    `Алерт по ${args.symbol} спрацював.`,
+    `Ціна зараз ≈ ${args.currentPrice.toFixed(4)}, таргет був ${args.targetPrice}.`,
+  ].join(" ");
+
+  const validationHint = `Wait for validation per ${strategyLabel}, e.g., CHOCH needed.`;
+
+  if (args.valid) {
+    if (args.mode === Mode.polite) {
+      return [
+        header,
+        "",
+        `За стратегією ${strategyLabel} сетап виглядає валідно.`,
+        args.reason,
+      ].join("\n");
+    }
+
+    if (args.mode === Mode.aggressive) {
+      return [
+        header,
+        "",
+        `Сетап за ${strategyLabel} виглядає робочим — діюй по плану, але не забувай про ризик.`,
+        args.reason,
+      ].join("\n");
+    }
+
+    // uncensored
+    return [
+      header,
+      "",
+      `Виглядає жирний сетап по ${strategyLabel}. Не зноси депозит, бро.`,
+      args.reason,
+    ].join("\n");
+  }
+
+  if (args.mode === Mode.polite) {
+    return [
+      header,
+      "",
+      `За стратегією ${strategyLabel} сетап ще сирий.`,
+      args.reason,
+      validationHint,
+    ].join("\n");
+  }
+
+  if (args.mode === Mode.aggressive) {
+    return [
+      header,
+      "",
+      `Почекай підтвердження за ${strategyLabel} перед входом.`,
+      args.reason,
+      validationHint,
+    ].join("\n");
+  }
+
+  // uncensored
+  return [
+    header,
+    "",
+    "Не лети в ринок, бро. Сетап ще не валідний.",
+    args.reason,
+    validationHint,
+  ].join("\n");
+}
+
+async function handleSingleAlert(alert: AlertWithUser): Promise<void> {
+  const { symbol, targetPrice, direction, user } = alert;
+  const target = Number(targetPrice);
+
+  if (!Number.isFinite(target) || target <= 0) {
+    await prisma.alert.update({
+      where: { id: alert.id },
+      data: { active: false },
+    });
+    return;
+  }
+
+  const currentPrice = await fetchCurrentPrice(symbol);
+
+  if (!currentPrice) {
+    return;
+  }
+
+  const triggered =
+    direction === AlertDirection.above
+      ? currentPrice >= target
+      : currentPrice <= target;
+
+  if (!triggered) {
+    return;
+  }
+
+  const validation = await validateAlertByStrategy({
+    symbol,
+    direction,
+    strategy: user.preferredStrategy,
+  });
+
+  const message = buildModeAwareAlertMessage({
+    mode: user.mode,
+    symbol,
+    strategy: user.preferredStrategy,
+    targetPrice: target,
+    currentPrice,
+    valid: validation.isValid,
+    reason: validation.reason,
+  });
+
+  try {
+    const chatId = Number.isFinite(Number(user.telegramId))
+      ? Number(user.telegramId)
+      : user.telegramId;
+
+    await bot.api.sendMessage(chatId, message);
+  } finally {
+    await prisma.alert.update({
+      where: { id: alert.id },
+      data: { active: false },
+    });
+  }
+}
+
+async function processAlertsTick(): Promise<void> {
+  const activeAlerts = await prisma.alert.findMany({
+    where: { active: true },
+    include: { user: true },
+  });
+
+  if (!activeAlerts.length) {
+    return;
+  }
+
+  for (const alert of activeAlerts) {
+    try {
+      await handleSingleAlert(alert);
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("Failed to handle alert", alert.id, error);
+    }
+  }
+}
+
+cron.schedule("*/5 * * * *", async () => {
+  await processAlertsTick();
+});
+
 bot.use(createConversation(setModeConversation, "setModeConversation"));
 bot.use(createConversation(setDepositConversation, "setDepositConversation"));
 bot.use(createConversation(setStrategyConversation, "setStrategyConversation"));
@@ -570,6 +1016,61 @@ bot.command("setstrategy", async (ctx) => {
 
 bot.command("add", async (ctx) => {
   await ctx.conversation.enter("addTradeConversation");
+});
+
+bot.command("alert", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+  const text = ctx.message?.text ?? "";
+  const parts = text.trim().split(/\s+/).slice(1);
+
+  if (parts.length < 3) {
+    await ctx.reply(
+      [
+        "Формат команди:",
+        "/alert SYMBOL PRICE above|below",
+        "Приклад: /alert BTCUSDT 65000 above",
+      ].join("\n"),
+    );
+    return;
+  }
+
+  const [symbolRaw, priceRaw, directionRaw] = parts;
+  const symbol = symbolRaw.toUpperCase();
+  const normalizedPrice = priceRaw.replace(",", ".");
+  const target = Number(normalizedPrice);
+
+  if (!Number.isFinite(target) || target <= 0) {
+    await ctx.reply("Ціна має бути додатнім числом.");
+    return;
+  }
+
+  const directionText = directionRaw.toLowerCase();
+  let direction: AlertDirection;
+
+  if (directionText === "above") {
+    direction = AlertDirection.above;
+  } else if (directionText === "below") {
+    direction = AlertDirection.below;
+  } else {
+    await ctx.reply("Напрямок має бути above або below.");
+    return;
+  }
+
+  await prisma.alert.create({
+    data: {
+      userId: user.id,
+      symbol,
+      targetPrice: target.toString(),
+      direction,
+    },
+  });
+
+  await ctx.reply(
+    [
+      `Алерт для ${symbol} на ціну ${target} (${directionText}) збережено.`,
+      "Буду чекати спрацювання раз на 5 хв з валідацією по стратегії.",
+    ].join("\n"),
+  );
 });
 
 bot.command("report", async (ctx) => {
