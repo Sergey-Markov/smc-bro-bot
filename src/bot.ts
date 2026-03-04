@@ -6,7 +6,9 @@ import {
   Conversation,
   ConversationFlavor,
 } from "@grammyjs/conversations";
+import OpenAI from "openai";
 import { prisma } from "./prisma";
+import { redis } from "./redis";
 import {
   Alert,
   AlertDirection,
@@ -26,10 +28,14 @@ if (!TELEGRAM_TOKEN) {
   throw new Error("TELEGRAM_TOKEN is not set in environment variables");
 }
 
-// GROK_API_KEY is loaded via dotenv for future AI features.
-// It is not used in this boilerplate yet, but is available via process.env.GROK_API_KEY.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const grokApiKey = GROK_API_KEY;
+
+const grokClient = grokApiKey
+  ? new OpenAI({
+      apiKey: grokApiKey,
+      baseURL: "https://api.x.ai/v1",
+    })
+  : null;
 
 type BotMode = "polite" | "aggressive" | "uncensored";
 
@@ -53,6 +59,46 @@ const bot = new Bot<MyContext>(TELEGRAM_TOKEN);
 const binance = new ccxt.binance({
   enableRateLimit: true,
 });
+
+async function getCachedValue(key: string): Promise<string | null> {
+  if (!redis) {
+    return null;
+  }
+
+  try {
+    return await redis.get(key);
+  } catch {
+    return null;
+  }
+}
+
+async function setCachedValue(
+  key: string,
+  value: string,
+  ttlSeconds: number,
+): Promise<void> {
+  if (!redis) {
+    return;
+  }
+
+  try {
+    await redis.set(key, value, "EX", ttlSeconds);
+  } catch {
+    // ignore cache errors
+  }
+}
+
+function modeToToneInstruction(mode: Mode): string {
+  if (mode === Mode.polite) {
+    return "polite - formal, conservative, calm tone";
+  }
+
+  if (mode === Mode.aggressive) {
+    return "aggressive - direct, pushy, urgent coaching tone";
+  }
+
+  return "uncensored - use slang, jokes, some swears, but stay helpful";
+}
 
 bot.use(
   session({
@@ -731,6 +777,63 @@ async function processOpenTradesTick(): Promise<void> {
   }
 }
 
+async function fetchOhlcvForAnalysis(symbol: string) {
+  try {
+    const [candles4h, candles1d] = await Promise.all([
+      binance.fetchOHLCV(symbol, "4h", undefined, 120),
+      binance.fetchOHLCV(symbol, "1d", undefined, 120),
+    ]);
+
+    return { candles4h, candles1d };
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("Failed to fetch analysis OHLCV for", symbol, error);
+    return null;
+  }
+}
+
+function formatOhlcvRows(
+  candles: ccxt.OHLCV[],
+  limit: number,
+): string {
+  const slice = candles.slice(-limit);
+
+  return slice
+    .map(([time, open, high, low, close, volume]) => {
+      const iso = new Date(time).toISOString();
+
+      return `${iso} | O:${open} H:${high} L:${low} C:${close} V:${volume}`;
+    })
+    .join("\n");
+}
+
+function serializeTradesForAi(trades: Trade[]): string {
+  if (!trades.length) {
+    return "No past trades for this user/symbol.";
+  }
+
+  return trades
+    .map((trade) => {
+      const entries = (trade.entries as unknown as number[]) || [];
+      const tps = (trade.tps as unknown as number[]) || [];
+
+      return [
+        `id=${trade.id}`,
+        `date=${trade.createdAt.toISOString()}`,
+        `symbol=${trade.symbol}`,
+        `direction=${trade.direction}`,
+        `entries=${entries.join(",") || "-"}`,
+        `tps=${tps.join(",") || "-"}`,
+        `slBe=${trade.slBe.toString()}`,
+        `size=${trade.size.toString()}`,
+        `riskPercent=${trade.riskPercent.toFixed(3)}`,
+        `profitLoss=${trade.profitLoss.toString()}`,
+        `strategy=${trade.strategy}`,
+      ].join(" | ");
+    })
+    .join("\n");
+}
+
 async function fetchOhlcvForValidation(
   symbol: string,
 ): Promise<{
@@ -1359,6 +1462,274 @@ bot.command("report", async (ctx) => {
   }
 
   await ctx.reply(lines.join("\n"));
+});
+
+bot.command("analyze", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+
+  if (!grokClient) {
+    await ctx.reply(
+      "Grok AI ще не налаштований. Додай GROK_API_KEY у .env та перезапусти бота.",
+    );
+    return;
+  }
+
+  const text = ctx.message?.text ?? "";
+  const parts = text.trim().split(/\s+/).slice(1);
+
+  if (!parts.length) {
+    await ctx.reply(
+      [
+        "Використання:",
+        "/analyze TRADE_ID",
+        "/analyze SYMBOL",
+        "",
+        "Приклади:",
+        "- /analyze 42  (аналіз конкретної угоди за id)",
+        "- /analyze BTCUSDT  (аналіз останньої угоди по символу та історії)",
+      ].join("\n"),
+    );
+    return;
+  }
+
+  const first = parts[0];
+  const isNumericId = /^\d+$/.test(first);
+
+  let targetTrade: Trade | null = null;
+  let tradesForHistory: Trade[] = [];
+  let symbol: string;
+
+  if (isNumericId) {
+    const tradeId = Number(first);
+
+    targetTrade = await prisma.trade.findFirst({
+      where: { id: tradeId, userId: user.id },
+    });
+
+    if (!targetTrade) {
+      await ctx.reply("Не знайшов угоду з таким id для цього користувача.");
+      return;
+    }
+
+    symbol = targetTrade.symbol;
+    tradesForHistory = await prisma.trade.findMany({
+      where: { userId: user.id, symbol },
+      orderBy: { createdAt: "desc" },
+      take: 30,
+    });
+  } else {
+    symbol = first.toUpperCase();
+    tradesForHistory = await prisma.trade.findMany({
+      where: { userId: user.id, symbol },
+      orderBy: { createdAt: "desc" },
+      take: 30,
+    });
+
+    if (!tradesForHistory.length) {
+      await ctx.reply(
+        "По цьому символу ще немає збережених угод. Спочатку додай /add.",
+      );
+      return;
+    }
+
+    targetTrade = tradesForHistory[0];
+  }
+
+  if (!targetTrade) {
+    await ctx.reply("Щось пішло не так при виборі угоди для аналізу.");
+    return;
+  }
+
+  const cacheKey = `analyze:v1:user:${user.id}:trade:${targetTrade.id}`;
+  const cached = await getCachedValue(cacheKey);
+
+  if (cached) {
+    await ctx.reply(cached);
+    return;
+  }
+
+  const ohlcv = await fetchOhlcvForAnalysis(symbol);
+
+  if (!ohlcv) {
+    await ctx.reply(
+      "Не вдалося отримати OHLCV дані для аналізу. Спробуй пізніше.",
+    );
+    return;
+  }
+
+  const historyBlock = serializeTradesForAi(tradesForHistory);
+  const ohlcv4hBlock = formatOhlcvRows(ohlcv.candles4h, 60);
+  const ohlcv1dBlock = formatOhlcvRows(ohlcv.candles1d, 60);
+
+  const modeTone = modeToToneInstruction(user.mode);
+  const preferredStrategy = user.preferredStrategy;
+
+  const userPromptLines: string[] = [];
+
+  userPromptLines.push(
+    "Analyze this trade based on history and strategies:",
+  );
+  userPromptLines.push(
+    "Strategies context: SMC (BOS/CHOCH/FVG), Swing (pullback to EMA), Range (low ATR), Breakout (volume + retest), Pullback (MA + structure), Divergence (RSI/MACD).",
+  );
+  userPromptLines.push(
+    `User preferred strategy: ${preferredStrategy}. Focus on it first, але враховуй контекст інших.`,
+  );
+  userPromptLines.push("");
+  userPromptLines.push("User mode and tone:");
+  userPromptLines.push(
+    `- mode: ${user.mode} -> ${modeTone}`,
+  );
+  userPromptLines.push(
+    "Always answer українською мовою, адаптуючи стиль під mode.",
+  );
+  userPromptLines.push("");
+  userPromptLines.push("Target trade (to analyze in detail):");
+  userPromptLines.push(serializeTradesForAi([targetTrade]));
+  userPromptLines.push("");
+  userPromptLines.push("User trade history for this symbol (latest first):");
+  userPromptLines.push(historyBlock);
+  userPromptLines.push("");
+  userPromptLines.push("4H OHLCV data (timestamp | O H L C V):");
+  userPromptLines.push(ohlcv4hBlock);
+  userPromptLines.push("");
+  userPromptLines.push("Daily OHLCV data (timestamp | O H L C V):");
+  userPromptLines.push(ohlcv1dBlock);
+  userPromptLines.push("");
+  userPromptLines.push(
+    "Give advice in [mode] tone per user's preferredStrategy. Побудуй чіткий розбір: вхід, контекст, ризики, помилки та покрокові рекомендації на майбутнє.",
+  );
+
+  const userPrompt = userPromptLines.join("\n");
+
+  try {
+    const completion = await grokClient.chat.completions.create({
+      model: "grok-2-latest",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are an advanced crypto trading coach using SMC, swing, range, breakout, pullback and divergence concepts. You always answer in Ukrainian.",
+        },
+        {
+          role: "user",
+          content: userPrompt,
+        },
+      ],
+    });
+
+    const content = completion.choices[0]?.message?.content;
+    const responseText = typeof content === "string" ? content : `${content ?? ""}`;
+
+    if (!responseText.trim()) {
+      await ctx.reply("Grok дав порожню відповідь. Спробуй ще раз трохи пізніше.");
+      return;
+    }
+
+    await setCachedValue(cacheKey, responseText, 60 * 60);
+    await ctx.reply(responseText);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("Grok /analyze error", error);
+    await ctx.reply("Не вийшло отримати відповідь від Grok. Спробуй ще раз пізніше.");
+  }
+});
+
+bot.command("sentiment", async (ctx) => {
+  const user = await getOrCreateUser(ctx);
+
+  if (!grokClient) {
+    await ctx.reply(
+      "Grok AI ще не налаштований. Додай GROK_API_KEY у .env та перезапусти бота.",
+    );
+    return;
+  }
+
+  const text = ctx.message?.text ?? "";
+  const parts = text.trim().split(/\s+/).slice(1);
+
+  if (!parts.length) {
+    await ctx.reply(
+      [
+        "Використання:",
+        "/sentiment SYMBOL",
+        "",
+        "Приклад: /sentiment BTCUSDT",
+      ].join("\n"),
+    );
+    return;
+  }
+
+  const rawSymbol = parts[0];
+  const symbol = rawSymbol.toUpperCase();
+
+  const cacheKey = `sentiment:v1:symbol:${symbol}:mode:${user.mode}:strategy:${user.preferredStrategy}`;
+  const cached = await getCachedValue(cacheKey);
+
+  if (cached) {
+    await ctx.reply(cached);
+    return;
+  }
+
+  const modeTone = modeToToneInstruction(user.mode);
+  const preferredStrategy = user.preferredStrategy;
+
+  const priceNow = await fetchCurrentPrice(symbol);
+
+  const lines: string[] = [];
+
+  lines.push(
+    `Sentiment for ${symbol} from recent news/X, impact on ${preferredStrategy} setups.`,
+  );
+  lines.push(
+    "Якщо можливо, базуйся на останніх новинах, потоках з X та ринковому контексті.",
+  );
+
+  if (priceNow) {
+    lines.push(`Поточна приблизна ціна з Binance: ${priceNow}.`);
+  }
+
+  lines.push("");
+  lines.push(
+    `User mode: ${user.mode} -> ${modeTone}. Always answer українською мовою, стиль відповіді підлаштовуй під mode.`,
+  );
+  lines.push(
+    "Сфокусуйся на тому, як настрій ринку впливає на валідність сетапів за цією стратегією (тригери, фільтри, коли краще не лізти).",
+  );
+
+  const userPrompt = lines.join("\n");
+
+  try {
+    const completion = await grokClient.chat.completions.create({
+      model: "grok-2-latest",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are an advanced crypto sentiment and macro context analyst. You always answer in Ukrainian.",
+        },
+        {
+          role: "user",
+          content: userPrompt,
+        },
+      ],
+    });
+
+    const content = completion.choices[0]?.message?.content;
+    const responseText = typeof content === "string" ? content : `${content ?? ""}`;
+
+    if (!responseText.trim()) {
+      await ctx.reply("Grok дав порожню відповідь. Спробуй ще раз трохи пізніше.");
+      return;
+    }
+
+    await setCachedValue(cacheKey, responseText, 15 * 60);
+    await ctx.reply(responseText);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("Grok /sentiment error", error);
+    await ctx.reply("Не вийшло отримати відповідь від Grok. Спробуй ще раз пізніше.");
+  }
 });
 
 bot.catch((err) => {
